@@ -18,7 +18,6 @@ struct SkiplistNode {
     SkiplistNode(int level, double sc, const std::string &mem) : forward(static_cast<size_t>(level), nullptr), score(sc), member(mem) {
     }
 };
-
 Skiplist::Skiplist() : head_(new SkiplistNode(kMaxLevel, 0.0, "")), level_(1), length_(0) {}
 
 // 依次删除第 0 层包含所有节点（即删除完整链表）
