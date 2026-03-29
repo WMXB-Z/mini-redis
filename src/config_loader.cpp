@@ -17,7 +17,7 @@ static std::string trim(const std::string &s) {
     return s.substr(i, j - i);
 }
 
-/* 配置文件解析函数，实现对配置文件中信息的解析
+/* 配置文件的解析函数，实现对配置文件中信息的解析
 含义：
 path：配置文件路径
 cfg：输出参数，存储解析结果
