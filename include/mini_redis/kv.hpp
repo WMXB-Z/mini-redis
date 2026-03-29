@@ -23,8 +23,10 @@ struct HashRecord {
     int64_t expire_at_ms = -1;
 };
 
+// 跳表节点
 struct SkiplistNode;
 
+// 跳表
 struct Skiplist {
     Skiplist(); 
     ~Skiplist();
@@ -39,7 +41,7 @@ private:
     static constexpr int kMaxLevel = 32;    //最大层数上限
     static constexpr double kProbability = 0.25;    //层数提升概率
     SkiplistNode *head_;    //跳表的头结点
-    int level_;     //跳表的最大层数
+    int level_;     //跳表的层数
     size_t length_; //跳表的元素数量
 };
 

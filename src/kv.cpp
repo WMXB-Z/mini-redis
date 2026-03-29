@@ -10,16 +10,18 @@ namespace mini_redis {
 
 // ---------------- Skiplist的实现 -----------------
 struct SkiplistNode {
-    double score;
-    std::string member;
-    std::vector<SkiplistNode *> forward;
-    SkiplistNode(int level, double sc, const std::string &mem) : score(sc), member(mem),
-                 forward(static_cast<size_t>(level), nullptr) {
+    double score;           //排序依据
+    std::string member;     //存储的元素
+    // 当前节点在第 i 层指向的“下一个节点”
+    // node->forward[i]，在第i层链表中，紧挨着node右边的那个节点
+    std::vector<SkiplistNode *> forward;    
+    SkiplistNode(int level, double sc, const std::string &mem) : forward(static_cast<size_t>(level), nullptr), score(sc), member(mem) {
     }
 };
 
 Skiplist::Skiplist() : head_(new SkiplistNode(kMaxLevel, 0.0, "")), level_(1), length_(0) {}
 
+// 依次删除第 0 层包含所有节点（即删除完整链表）
 Skiplist::~Skiplist() {
     SkiplistNode *cur = head_->forward[0];
     while (cur) {
@@ -30,25 +32,33 @@ Skiplist::~Skiplist() {
     delete head_;
 }
 
+// 随机生成节点层数（跳表核心），高层节点稀疏，查找复杂度 O(log n)
 int Skiplist::randomLevel() {
     int lvl = 1;
-    while ((std::rand() & 0xFFFF) < static_cast<int>(kProbability * 0xFFFF) &&
-           lvl < kMaxLevel) {
+    // (std::rand() & 0xFFFF)：取随机数低16位（0~65535）
+    while ((std::rand() & 0xFFFF) < static_cast<int>(kProbability * 0xFFFF) && lvl < kMaxLevel) {
         ++lvl;
     }
     return lvl;
 }
 
+// 定义跳表的排序规则
 static inline bool less_score_member(double a_sc, const std::string &a_m, double b_sc, const std::string &b_m) {
     if (a_sc != b_sc)
         return a_sc < b_sc;
     return a_m < b_m;
 }
 
+// 找到每一层的插入位置（update[]），随机生成节点层数，在每一层插入节点（改指针）
 bool Skiplist::insert(double score, const std::string &member) {
+    // 第i层中，如果要插入，则这位置的前驱节点是update[i]
+    // 作用：存放每一层你找到的插入点的“前一个节点”
     std::vector<SkiplistNode *> update(static_cast<size_t>(kMaxLevel));
+
     SkiplistNode *x = head_;
+    // 从最高层开始查找插入位置（可能会更新多层）
     for (int i = level_ - 1; i >= 0; --i) {
+        // 在第i层：一直往右走，直到不能再走（即找到插入点）
         while (x->forward[static_cast<size_t>(i)] &&
                less_score_member(x->forward[static_cast<size_t>(i)]->score,
                                  x->forward[static_cast<size_t>(i)]->member,
@@ -57,27 +67,32 @@ bool Skiplist::insert(double score, const std::string &member) {
         }
         update[static_cast<size_t>(i)] = x;
     }
+
     x = x->forward[0];
-    if (x && x->score == score && x->member == member) {
+    if (x && x->score == score && x->member == member) {    //检查元素是否已经存在
         return false; // existed
     }
-    int lvl = randomLevel();
+    int lvl = randomLevel();    //随机生成新节点要处于的层
+    // 如果突破新高，则要进行扩展
     if (lvl > level_) {
         for (int i = level_; i < lvl; ++i)
             update[static_cast<size_t>(i)] = head_;
         level_ = lvl;
     }
+    // nx为待插入的节点
     SkiplistNode *nx = new SkiplistNode(lvl, score, member);
     for (int i = 0; i < lvl; ++i) {
-        nx->forward[static_cast<size_t>(i)] =
-            update[static_cast<size_t>(i)]->forward[static_cast<size_t>(i)];
+        nx->forward[static_cast<size_t>(i)] = update[static_cast<size_t>(i)]->forward[static_cast<size_t>(i)];
         update[static_cast<size_t>(i)]->forward[static_cast<size_t>(i)] = nx;
     }
     ++length_;
     return true;
 }
 
+// 找到每一层的删除位置（update[]），逐层删除该节点，重设跳表层高
 bool Skiplist::erase(double score, const std::string &member) {
+    // 第i层中，如果要删除，则这位置的前驱节点是update[i]
+    // 作用：存放每一层你找到的删除点的“前一个节点”
     std::vector<SkiplistNode *> update(static_cast<size_t>(kMaxLevel));
     SkiplistNode *x = head_;
     for (int i = level_ - 1; i >= 0; --i) {
@@ -89,38 +104,48 @@ bool Skiplist::erase(double score, const std::string &member) {
         }
         update[static_cast<size_t>(i)] = x;
     }
+    // 原本x为待删除节点的前一个节点。现在后置一位，使得x为待删除的节点
     x = x->forward[0];
     if (!x || x->score != score || x->member != member)
         return false;
+
     for (int i = 0; i < level_; ++i) {
-        if (update[static_cast<size_t>(i)]->forward[static_cast<size_t>(i)] ==
-            x) {
-            update[static_cast<size_t>(i)]->forward[static_cast<size_t>(i)] =
-                x->forward[static_cast<size_t>(i)];
+        if (update[static_cast<size_t>(i)]->forward[static_cast<size_t>(i)] == x) {
+            update[static_cast<size_t>(i)]->forward[static_cast<size_t>(i)] = x->forward[static_cast<size_t>(i)];
         }
     }
     delete x;
-    while (level_ > 1 &&
-           head_->forward[static_cast<size_t>(level_ - 1)] == nullptr) {
+    // 如果跳表的>1的层中只有头结点， 则说明该层已经不具备查找能力，直接删除这层即可
+    while (level_ > 1 && head_->forward[static_cast<size_t>(level_ - 1)] == nullptr) {
         --level_;
     }
     --length_;
     return true;
 }
 
+// 将跳表中指定范围内的元素通过vector参数返回
 void Skiplist::rangeByRank(int64_t start, int64_t stop, std::vector<std::string> &out) const {
     if (length_ == 0)
         return;
     int64_t n = static_cast<int64_t>(length_);
-    auto norm = [&](int64_t idx) {
-        if (idx < 0)
-            idx = n + idx;
-        if (idx < 0)
-            idx = 0;
-        if (idx >= n)
-            idx = n - 1;
+    // auto norm = [&](int64_t idx) {
+    //     if (idx < 0)
+    //         idx = n + idx;
+    //     if (idx < 0)
+    //         idx = 0;
+    //     if (idx >= n)
+    //         idx = n - 1;
+    //     return idx;
+    // };
+    // 将索引规范化：支持负索引并裁剪越界
+    auto norm = [&](int64_t idx) -> int64_t {
+        // 支持负索引，-1表示最后一个元素
+        if (idx < 0) idx += n;
+        if (idx < 0) idx = 0;       // // 越界裁剪，下界
+        else if (idx >= n) idx = n - 1; // 上界
         return idx;
     };
+
     int64_t s = norm(start), e = norm(stop);
     if (s > e)
         return;
@@ -138,6 +163,7 @@ void Skiplist::rangeByRank(int64_t start, int64_t stop, std::vector<std::string>
     }
 }
 
+// 将跳表转为vector，即将跳表中元素依次放入vector中，并返回这个vector
 void Skiplist::toVector(std::vector<std::pair<double, std::string>> &out) const {
     out.clear();
     out.reserve(length_);
@@ -149,7 +175,6 @@ void Skiplist::toVector(std::vector<std::pair<double, std::string>> &out) const 
 }
 
 // ---------------- KeyValueStore 的实现 -----------------
-
 // 返回当前时间戳（毫秒）
 int64_t KeyValueStore::nowMs() {
     using namespace std::chrono;
