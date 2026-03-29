@@ -1,8 +1,6 @@
 #include "mini_redis/aof.hpp"
-
 #include "mini_redis/kv.hpp"
 #include "mini_redis/log.hpp"
-
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
