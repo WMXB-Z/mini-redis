@@ -23,7 +23,7 @@ namespace mini_redis {
 // 服务器响应（如返回计数或长度信息时）:100
 //     └─ Integer: 100
 // 总结：
-// 客户端命令 Array → 内部元素都用 Bulk String
+// 客户端的命令使用Array → Array的内部元素使用用 Bulk String类型
 // 服务器响应 → 根据类型可能用 Simple String / Integer / Bulk String / Error
 
 enum class RespType {

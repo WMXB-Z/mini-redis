@@ -187,7 +187,6 @@ std::optional<RespValue> RespParser::tryParseOne() {
     buffer_.erase(0, pos);
     return out;
 }
-
 // 与上面的区别是:返回结果会保存原始RESP数据
 std::optional<std::pair<RespValue, std::string>> RespParser::tryParseOneWithRaw() {
     if (buffer_.empty())
@@ -245,6 +244,7 @@ std::string respBulk(std::string_view s) {
 }
 
 std::string respNullBulk() { return "$-1\r\n"; }
+
 std::string respInteger(int64_t v) { return ":" + std::to_string(v) + "\r\n"; }
 
 } // namespace mini_redis

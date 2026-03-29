@@ -122,8 +122,7 @@ bool loadConfigFromFile(const std::string &path, ServerConfig &cfg, std::string 
                 return false;
             }
         } else if (key == "aof.fadvise_dontneed_after_sync") {//设置写完后是否调用posix_fadvise(DONTNEED)。释放 page cache，避免缓存污染
-            cfg.aof.fadvise_dontneed_after_sync =
-                (val == "1" || val == "true" || val == "yes");
+            cfg.aof.fadvise_dontneed_after_sync = (val == "1" || val == "true" || val == "yes");
         } else if (key == "rdb.enabled") {//设置是否启用 RDB（另一种持久化方式）
             cfg.rdb.enabled = (val == "1" || val == "true" || val == "yes");
         } else if (key == "rdb.dir") {//设置快照保存目录

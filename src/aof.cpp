@@ -14,66 +14,17 @@
 
 namespace mini_redis {
 
-static std::string joinPath(const std::string &dir, const std::string &file) {
-    if (dir.empty())
-        return file;
-    if (dir.back() == '/')
-        return dir + file;
-    return dir + "/" + file;
-}
-
-static bool writeAllFD(int fd, const char *data, size_t len) {
-    size_t off = 0;
-    while (off < len) {
-        ssize_t w = ::write(fd, data + off, len - off);
-        if (w > 0) {
-            off += static_cast<size_t>(w);
-            continue;
-        }
-        if (w < 0 && (errno == EINTR || errno == EAGAIN)) {
-            continue;
-        }
-        return false;
-    }
-    return true;
-}
-
-
-std::string toRespArray(const std::vector<std::string> &parts) {
-    std::string out;
-    out.reserve(16 * parts.size());
-    out.append("*").append(std::to_string(parts.size())).append("\r\n");
-    for (const auto &p : parts) {
-        out.append("$").append(std::to_string(p.size())).append("\r\n");
-        out.append(p).append("\r\n");
-    }
-    return out;
-}
-
-std::optional<AofMode> parseAofMode(const std::string &s) {
-    if (s == "no")
-        return AofMode::kNo;
-    if (s == "everysec")
-        return AofMode::kEverySec;
-    if (s == "always")
-        return AofMode::kAlways;
-    return std::nullopt;
-}
-
 AofLogger::AofLogger() = default;
 AofLogger::~AofLogger() { shutdown(); }
 
-std::string AofLogger::path() const {
-    return joinPath(opts_.dir, opts_.filename);
-}
-
+// AOF初始化+启动后台写线程
 bool AofLogger::init(const AofOptions &opts, std::string &err) {
     opts_ = opts;
     if (!opts_.enabled)
         return true;
     std::error_code ec;
-    std::filesystem::create_directories(opts_.dir, ec);
-    if (ec) {
+    std::filesystem::create_directories(opts_.dir, ec); //创建AOF文件所在目录（支持递归创建）
+    if (ec) {   //有值，则说明文件创建出问题
         err = "mkdir failed: " + opts_.dir;
         return false;
     }
@@ -82,59 +33,71 @@ bool AofLogger::init(const AofOptions &opts, std::string &err) {
         err = "open AOF failed: " + path();
         return false;
     }
-    // 预分配，降低元数据更新成本
-#ifdef __linux__
+    // Linux中预分配文件空间，降低元数据更新成本
+    #ifdef __linux__
     if (opts_.prealloc_bytes > 0) {
         posix_fallocate(fd_, 0, static_cast<off_t>(opts_.prealloc_bytes));
     }
-#endif
+    #endif
     running_.store(true);
     stop_.store(false);
     writer_thread_ = std::thread(&AofLogger::writerLoop, this);
     return true;
 }
 
+// 关闭后台线程
 void AofLogger::shutdown() {
     running_.store(false);
     stop_.store(true);
     cv_.notify_all();
     if (writer_thread_.joinable())
-        writer_thread_.join();
+        writer_thread_.join();  //关闭后台的追写AOF线程
+
+    if (rewriter_thread_.joinable()) 
+        rewriter_thread_.join();  //关闭后台的重写AOF线程
+    
     if (fd_ >= 0) {
-        ::fdatasync(fd_);
+        ::fdatasync(fd_);//将文件缓冲区的数据 刷入磁盘，保证 AOF 数据持久化
         ::close(fd_);
-        fd_ = -1;
+        fd_ = -1;//标记文件已关闭
     }
 }
 
+// 向 AOF（Append-Only File）写入一条命令，传入的参数为字符串数组
 bool AofLogger::appendCommand(const std::vector<std::string> &parts) {
     if (!opts_.enabled || fd_ < 0)
         return true;
-    std::string line = toRespArray(parts);
+
+    std::string line = respArray(parts);
     std::string line_copy;
     bool need_incr = rewriting_.load();
-    if (need_incr)
-        line_copy = line; // 复制一份用于增量缓冲
+    if (need_incr) //检查是否正在进行 AOF文件的压缩重写
+        line_copy = line; // 如果是，则复制一份用于增量缓冲，以便后续追加到压缩后的新AOF文件中
     int64_t my_seq = 0;
-    {
+    {   //保证队列操作的线程安全
         std::lock_guard<std::mutex> lg(mtx_);
         pending_bytes_ += line.size();
         my_seq = ++seq_gen_;
         queue_.push_back(AofItem{std::move(line), my_seq});
     }
+    // //即使 BGREWRITEAOF 最终生成新 AOF 文件，也不能让新命令只写入 incr_cmds_：
+    // - queue_ 保证命令在当前 AOF 中立即持久化，防止崩溃丢失。
+    // - incr_cmds_ 保证 BGREWRITEAOF完成后新文件也完整。如果不写入queue_，BGREWRITEAOF 完成之前发送崩溃，就会丢失数据
+    // 因此必须同时写入两个队列。
     if (need_incr) {
         std::lock_guard<std::mutex> lk(incr_mtx_);
         incr_cmds_.emplace_back(std::move(line_copy));
     }
+
     cv_.notify_one();
     if (opts_.mode == AofMode::kAlways) {
         std::unique_lock<std::mutex> lk(mtx_);
-        cv_commit_.wait(
-            lk, [&] { return last_synced_seq_ >= my_seq || stop_.load(); });
+        cv_commit_.wait(lk, [&] {return last_synced_seq_ >= my_seq || stop_.load(); });
     }
     return true;
 }
 
+// 向 AOF（Append-Only File）写入一条命令，传入的RESP原始命令
 bool AofLogger::appendRaw(const std::string &raw_resp) {
     if (!opts_.enabled || fd_ < 0)
         return true;
@@ -156,20 +119,19 @@ bool AofLogger::appendRaw(const std::string &raw_resp) {
     cv_.notify_one();
     if (opts_.mode == AofMode::kAlways) {
         std::unique_lock<std::mutex> lk(mtx_);
-        cv_commit_.wait(
-            lk, [&] { return last_synced_seq_ >= my_seq || stop_.load(); });
+        cv_commit_.wait(lk, [&] { return last_synced_seq_ >= my_seq || stop_.load(); });
     }
     return true;
 }
 
+// 从AOF文件中读取已有命令，并将它们重放到 KeyValueStore 中，实现“恢复数据库状态”的功能
 bool AofLogger::load(KeyValueStore &store, std::string &err) {
     if (!opts_.enabled)
         return true;
     int rfd = ::open(path().c_str(), O_RDONLY);
-    if (rfd < 0) {
-        // not fatal if file does not exist
+    if (rfd < 0) 
         return true;
-    }
+    
     std::string buf;
     buf.resize(1 << 20);
     std::string data;
@@ -185,10 +147,10 @@ bool AofLogger::load(KeyValueStore &store, std::string &err) {
         data.append(buf.data(), static_cast<size_t>(r));
     }
     ::close(rfd);
-    // very simple replay: parse by lines; expect only SET/DEL/EXPIRE subset
-    // For robustness, reuse RespParser (not included here to avoid dependency
-    // circle). Minimal parse:
+    // 为了增强健壮性，本可以复用 RespParser（但这里没有这样做，是为了避免依赖循环）
+    // 这里只做最简化的解析，按行解析，只预期处理 SET/DEL/EXPIRE 这几类命令的子集。
     size_t pos = 0;
+    // 用于判断是否能读出一行完整数据（以/r/n为结尾）
     auto readLine = [&](std::string &out) -> bool {
         size_t e = data.find("\r\n", pos);
         if (e == std::string::npos)
@@ -197,12 +159,15 @@ bool AofLogger::load(KeyValueStore &store, std::string &err) {
         pos = e + 2;
         return true;
     };
+
     while (pos < data.size()) {
         if (data[pos++] != '*')
             break;
+
         std::string line;
         if (!readLine(line))
             break;
+
         int n = std::stoi(line);
         std::vector<std::string> parts;
         parts.reserve(n);
@@ -221,14 +186,18 @@ bool AofLogger::load(KeyValueStore &store, std::string &err) {
                 return false;
             }
             parts.emplace_back(data.data() + pos, static_cast<size_t>(len));
-            pos += static_cast<size_t>(len) + 2; // skip CRLF
+            pos += static_cast<size_t>(len) + 2; // skip /r/n
         }
+        
         if (parts.empty())
             continue;
+
+        // parts数组中首个元素为指令符，将其转为大写，并判断其操作类型
         std::string cmd;
         cmd.reserve(parts[0].size());
         for (char c : parts[0])
             cmd.push_back(static_cast<char>(::toupper(c)));
+
         if (cmd == "SET" && parts.size() == 3) {
             store.set(parts[1], parts[2]);
         } else if (cmd == "DEL" && parts.size() >= 2) {
@@ -242,58 +211,53 @@ bool AofLogger::load(KeyValueStore &store, std::string &err) {
     return true;
 }
 
-} // namespace mini_redis
-
-namespace mini_redis {
-
+// AOF 后台写线程主循环
 void AofLogger::writerLoop() {
-    const size_t kBatchBytes =
-        opts_.batch_bytes > 0 ? opts_.batch_bytes : (64 * 1024);
-    const int kMaxIov = 64;
-    const auto kWaitNs = std::chrono::microseconds(
-        opts_.batch_wait_us > 0 ? opts_.batch_wait_us : 1000);
+    const size_t kBatchBytes = opts_.batch_bytes > 0 ? opts_.batch_bytes : (64 * 1024);//单次最多写多少字节（软上限）
+    const int kMaxIov = 64; //writev 最多支持几个个 buffer（iovec）
+    // 如果队列为空，最多等待多久
+    const auto kWaitNs = std::chrono::microseconds(opts_.batch_wait_us > 0 ? opts_.batch_wait_us : 1000);
 
     std::vector<AofItem> local;
-    local.reserve(256);
+    local.reserve(256);//本地缓存，用于批量写入
 
-    while (!stop_.load()) {
-        // 若需要暂停以进行原子切换，则进入暂停状态
-        if (pause_writer_.load()) {
+    while (!stop_.load()) { //线程一直跑，直到 stop
+
+        if (pause_writer_.load()) { //暂停机制（用于 AOF rewrite 等）
             std::unique_lock<std::mutex> lk(pause_mtx_);
             writer_is_paused_ = true;
-            cv_pause_.notify_all();
-            cv_pause_.wait(
-                lk, [&] { return !pause_writer_.load() || stop_.load(); });
+            cv_pause_.notify_all(); //通知外部，我已经暂停了
+            cv_pause_.wait(lk, [&] { return !pause_writer_.load() || stop_.load(); });
             writer_is_paused_ = false;
             if (stop_.load())
                 break;
         }
+
         local.clear();
-        size_t bytes = 0;
+        size_t bytes = 0;   //记录写入磁盘的字节数
         {
             std::unique_lock<std::mutex> lk(mtx_);
             if (queue_.empty()) {
-                cv_.wait_for(lk, kWaitNs,
-                             [&] { return stop_.load() || !queue_.empty(); });
+                cv_.wait_for(lk, kWaitNs, [&] { return stop_.load() || !queue_.empty(); });
             }
-            while (!queue_.empty() && (bytes < kBatchBytes) &&
-                   (int)local.size() < kMaxIov) {
+
+            while (!queue_.empty() && (bytes < kBatchBytes) && (int)local.size() < kMaxIov) {
                 local.emplace_back(std::move(queue_.front()));
                 bytes += local.back().data.size();
                 queue_.pop_front();
             }
+
             if (pending_bytes_ >= bytes)
-                pending_bytes_ -= bytes;
+                pending_bytes_ -= bytes;    //表示“还没写入磁盘的数据量”
             else
                 pending_bytes_ = 0;
         }
 
         if (local.empty()) {
-            // everysec 模式周期性刷盘
-            if (opts_.mode == AofMode::kEverySec) {
+            if (opts_.mode == AofMode::kEverySec) { 
+                // everysec 模式周期性刷盘，即使当前没有新数据写入（queue 为空），也必须“定时刷盘”，否则数据可能一直停留在内核缓存里。
                 auto now = std::chrono::steady_clock::now();
-                auto interval = std::chrono::milliseconds(
-                    opts_.sync_interval_ms > 0 ? opts_.sync_interval_ms : 1000);
+                auto interval = std::chrono::milliseconds(opts_.sync_interval_ms > 0 ? opts_.sync_interval_ms : 1000);
                 if (now - last_sync_tp_ >= interval) {
                     if (fd_ >= 0)
                         ::fdatasync(fd_);
@@ -315,22 +279,22 @@ void AofLogger::writerLoop() {
         }
 
         // 聚合写入，处理部分写
-        int start_idx = 0;
-        size_t start_off = 0;
+        int start_idx = 0;      //iov的块间偏移量
+        size_t start_off = 0;   //iov的块内偏移量
         while (start_idx < iovcnt) {
             ssize_t w = ::writev(fd_, &iov[start_idx], iovcnt - start_idx);
-            if (w < 0) {
-                // 出错：简单退让，避免忙等
+            if (w < 0) { // 出错：简单退让，避免忙等
                 ::usleep(1000);
                 break;
             }
+
             size_t rem = static_cast<size_t>(w);
             while (rem > 0 && start_idx < iovcnt) {
                 size_t avail = iov[start_idx].iov_len - start_off;
                 if (rem < avail) {
                     start_off += rem;
-                    iov[start_idx].iov_base =
-                        static_cast<char *>(iov[start_idx].iov_base) + rem;
+                    // 对这个没写完的块进行调整，将还没写的部分重设为iov的内容
+                    iov[start_idx].iov_base = static_cast<char *>(iov[start_idx].iov_base) + rem;
                     iov[start_idx].iov_len = avail - rem;
                     rem = 0;
                 } else {
@@ -343,36 +307,34 @@ void AofLogger::writerLoop() {
                 break; // 不太可能，但防止死循环
         }
 
-        // Linux 可选：触发后台回写，平滑尾部写放大
-#ifdef __linux__
-        if (opts_.use_sync_file_range && bytes >= opts_.sfr_min_bytes) {
-            // 对最近写入的区间进行提示。这里为了简化，使用整个文件范围（可能较重），可进一步优化记录
-            // offset
-            off_t cur = ::lseek(fd_, 0, SEEK_END);
-            if (cur > 0) {
-                // 提示内核把 [cur-bytes, cur) 写回磁盘
+        // **脏页（dirty page）**存放在 page cache 里
+        // 内核负责管理这些脏页的写回到磁盘
+        // 用户程序通常不直接干预写回，除非调用 fdatasync / fsync 或 sync_file_range 等系统调用
+
+        // 正常写 AOF 的流程是：writev → 数据进入 page cache（内核缓存） → 某个时刻 fdatasync → 才真正落盘
+        // 如果一直 write，但不提前刷,则fdatasync 时 → 一次性刷大量数据 → 卡顿（延迟抖动）
+        // 主动触发后台回写，即告诉内核可以把这段数据刷到磁盘了
+
+        #ifdef __linux__
+        if (opts_.use_sync_file_range && bytes >= opts_.sfr_min_bytes) {    //启用主动刷盘，且写入数据达到写回阈值
+            off_t cur = ::lseek(fd_, 0, SEEK_END);  //获取当前文件末尾
+            if (cur > 0) { // 提示内核把 [cur-bytes, cur) 写回磁盘
                 off_t start = cur - static_cast<off_t>(bytes);
                 if (start < 0)
                     start = 0;
-                // SYNC_FILE_RANGE_WRITE: 发起写回请求但不等待完成
-                (void)::sync_file_range(fd_, start, static_cast<off_t>(bytes),
-                                        SYNC_FILE_RANGE_WRITE);
+                // SYNC_FILE_RANGE_WRITE: 发起写回请求但不等待完成(异步非阻塞，不保证落盘即数据不安全)
+                (void)::sync_file_range(fd_, start, static_cast<off_t>(bytes), SYNC_FILE_RANGE_WRITE);
             }
         }
-#endif
+        #endif
 
         // 模式处理
         if (opts_.mode == AofMode::kAlways) {
-            ::fdatasync(fd_);
-#ifdef __linux__
-            if (opts_.fadvise_dontneed_after_sync) {
-                off_t cur2 = ::lseek(fd_, 0, SEEK_END);
-                if (cur2 > 0) {
-                    (void)::posix_fadvise(fd_, 0, cur2, POSIX_FADV_DONTNEED);
-                }
-            }
-#endif
-            // 更新已提交序号并唤醒等待者
+            // 1）落盘操作
+            ::fdatasync(fd_);   //调用系统调用 fdatasync，把 page cache 中对应文件的数据页 立即写回磁盘，阻塞调用
+
+            // 2）更新last_synced_seq_
+            // 更新已提交序号并唤醒等待者(这里不直接用local的最后一个元素的seq，而是如此做，是为了一定程度上解耦合)
             int64_t max_seq = 0;
             for (auto &it : local)
                 max_seq = std::max(max_seq, it.seq);
@@ -381,29 +343,56 @@ void AofLogger::writerLoop() {
                 last_synced_seq_ = std::max(last_synced_seq_, max_seq);
             }
             cv_commit_.notify_all();
+
+            // 3）释放已经落盘的缓存
+            #ifdef __linux__
+            if (opts_.fadvise_dontneed_after_sync) {    //如果用户启用了缓存清除优化，则刷盘后，将缓存中的数据释放
+                off_t cur2 = ::lseek(fd_, 0, SEEK_END);
+                if (cur2 > 0) {
+                    // posix_fadvise 用法：（同步阻塞，保证落盘即数据安全）
+                    // 第 1 个参数：文件描述符
+                    // 第 2、3 个参数：起始偏移和长度（这里从 0 到文件末尾）
+                    // 第 4 个参数：建议内核策略，这里是 POSIX_FADV_DONTNEED → 告诉内核这些缓存页可以丢掉
+                    // 这样做就是为了减少AOF写盘过程对内存资源的占用，减少对其它功能的影响
+                    (void)::posix_fadvise(fd_, 0, cur2, POSIX_FADV_DONTNEED);
+                }
+            }
+            #endif
+
         } else if (opts_.mode == AofMode::kEverySec) {
             auto now = std::chrono::steady_clock::now();
             auto interval = std::chrono::milliseconds(
-                opts_.sync_interval_ms > 0 ? opts_.sync_interval_ms : 1000);
+            opts_.sync_interval_ms > 0 ? opts_.sync_interval_ms : 1000);
             if (now - last_sync_tp_ >= interval) {
-                ::fdatasync(fd_);
+                ::fdatasync(fd_);   // 阻塞写盘，保证数据安全
                 last_sync_tp_ = now;
-#ifdef __linux__
+
+                // 更新 last_synced_seq_ 并通知等待者
+                int64_t max_seq = 0;
+                for (auto &it : local)
+                    max_seq = std::max(max_seq, it.seq);
+                {
+                    std::lock_guard<std::mutex> lg(mtx_);
+                    last_synced_seq_ = std::max(last_synced_seq_, max_seq);
+                }
+                cv_commit_.notify_all();
+
+                #ifdef __linux__
                 if (opts_.fadvise_dontneed_after_sync) {
                     off_t cur3 = ::lseek(fd_, 0, SEEK_END);
-                    if (cur3 > 0) {
-                        (void)::posix_fadvise(fd_, 0, cur3,
-                                              POSIX_FADV_DONTNEED);
+                    if (cur3 > 0) { 
+                        (void)::posix_fadvise(fd_, 0, cur3, POSIX_FADV_DONTNEED);
                     }
                 }
-#endif
+                #endif
             }
         }
+
     }
 
-    // 退出前 flush
+    // 退出前也要flush，保证加缓存队列中的数据存入磁盘
     if (fd_ >= 0) {
-        // 把剩余队列写完
+
         while (true) {
             std::vector<AofItem> rest;
             size_t bytes = 0;
@@ -419,8 +408,10 @@ void AofLogger::writerLoop() {
                 else
                     pending_bytes_ = 0;
             }
+
             if (rest.empty())
                 break;
+
             struct iovec iov2[64];
             int n = 0;
             for (auto &it : rest) {
@@ -428,11 +419,15 @@ void AofLogger::writerLoop() {
                 iov2[n].iov_len = it.data.size();
                 ++n;
             }
+
             int start_idx2 = 0;
             size_t start_off2 = 0;
             while (start_idx2 < n) {
                 ssize_t w2 = ::writev(fd_, &iov2[start_idx2], n - start_idx2);
-                if (w2 < 0) {
+                if (w2 < 0) {   //处理可能的系统调用失败情况
+                    // EINTR：系统调用被信号打断 → 重试。
+                    // EAGAIN：资源暂时不可用 → 重试。
+                    // 其他错误直接跳出循环。
                     if (errno == EINTR || errno == EAGAIN)
                         continue;
                     else
@@ -458,26 +453,34 @@ void AofLogger::writerLoop() {
                     break;
             }
         }
+
+        // 执行刷盘
         ::fdatasync(fd_);
     }
 }
 
+// 启动 AOF 后台重写（background rewrite）线程
 bool AofLogger::bgRewrite(KeyValueStore &store, std::string &err) {
     if (!opts_.enabled) {
         err = "aof disabled";
         return false;
     }
     bool expected = false;
+    // compare_exchange_strong：rewriting_ == expected (false)，就把它改成 true，并返回true
+    // 防止多个线程同时进入 rewrite
     if (!rewriting_.compare_exchange_strong(expected, true)) {
         err = "rewrite already running";
         return false;
     }
+
+    if(rewriter_thread_.joinable) 
+        rewriter_thread_.join();
+
     rewriter_thread_ = std::thread(&AofLogger::rewriterLoop, this, &store);
     return true;
 }
 
-static std::string joinPath(const std::string &dir, const std::string &file);
-
+// 重写AOF文件（实现压缩效果）
 void AofLogger::rewriterLoop(KeyValueStore *store) {
     // 1) 生成临时文件路径
     std::string tmp_path = joinPath(opts_.dir, opts_.filename + ".rewrite.tmp");
@@ -488,39 +491,39 @@ void AofLogger::rewriterLoop(KeyValueStore *store) {
     }
 
     // 2) 遍历快照，输出最小命令集
-    // String
-    {
+    // 把当前内存里string类型的 KV 数据“重写”为一组命令，写入新AOF文件
+    {  
         auto snap = store->snapshot();
         for (const auto &kv : snap) {
             const std::string &k = kv.first;
             const auto &r = kv.second;
             std::vector<std::string> parts = {"SET", k, r.value};
-            std::string line = toRespArray(parts);
+            std::string line = respArray(parts);
             writeAllFD(wfd, line.data(), line.size());
-            if (r.expire_at_ms > 0) {
-                int64_t now =
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
+            
+            //如果有过期时间，则同时生成"EXPIRE key ttl"命令（给key设置过期时间）
+             if (r.expire_at_ms > 0) { 
+                int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now().time_since_epoch())
                         .count();
                 int64_t ttl = (r.expire_at_ms - now) / 1000;
                 if (ttl < 1)
                     ttl = 1;
                 std::vector<std::string> e = {"EXPIRE", k, std::to_string(ttl)};
-                std::string el = toRespArray(e);
+                std::string el = respArray(e);
                 writeAllFD(wfd, el.data(), el.size());
             }
         }
     }
-    // Hash
+    // Hash类型同上
     {
         auto snap = store->snapshotHash();
         for (const auto &kv : snap) {
             const std::string &key = kv.first;
             const auto &h = kv.second;
             for (const auto &fv : h.fields) {
-                std::vector<std::string> parts = {"HSET", key, fv.first,
-                                                  fv.second};
-                std::string line = toRespArray(parts);
+                std::vector<std::string> parts = {"HSET", key, fv.first,fv.second};
+                std::string line = respArray(parts);
                 writeAllFD(wfd, line.data(), line.size());
             }
             if (h.expire_at_ms > 0) {
@@ -531,21 +534,20 @@ void AofLogger::rewriterLoop(KeyValueStore *store) {
                 int64_t ttl = (h.expire_at_ms - now) / 1000;
                 if (ttl < 1)
                     ttl = 1;
-                std::vector<std::string> e = {"EXPIRE", key,
-                                              std::to_string(ttl)};
-                std::string el = toRespArray(e);
+                std::vector<std::string> e = {"EXPIRE", key, std::to_string(ttl)};
+                std::string el = respArray(e);
                 writeAllFD(wfd, el.data(), el.size());
             }
         }
     }
-    // ZSet
+    // ZSet类型同上
     {
         auto snap = store->snapshotZSet();
         for (const auto &flat : snap) {
             for (const auto &it : flat.items) {
                 std::vector<std::string> parts = {
                     "ZADD", flat.key, std::to_string(it.first), it.second};
-                std::string line = toRespArray(parts);
+                std::string line = respArray(parts);
                 writeAllFD(wfd, line.data(), line.size());
             }
             if (flat.expire_at_ms > 0) {
@@ -558,19 +560,20 @@ void AofLogger::rewriterLoop(KeyValueStore *store) {
                     ttl = 1;
                 std::vector<std::string> e = {"EXPIRE", flat.key,
                                               std::to_string(ttl)};
-                std::string el = toRespArray(e);
+                std::string el = respArray(e);
                 writeAllFD(wfd, el.data(), el.size());
             }
         }
     }
 
-    // 3) 进入切换阶段：暂停 writer，写入最终增量并原子替换
+    // 3) 进入切换阶段：暂停writer，写入最终增量并原子替换
     pause_writer_.store(true);
     {
         std::unique_lock<std::mutex> lk(pause_mtx_);
+        // 修改pause_writer_标志后，重写线程先被阻塞，等到追写线程被阻塞后（即暂停后），重写线程会被唤醒
         cv_pause_.wait(lk, [&] { return writer_is_paused_; });
     }
-    // 在 writer 暂停期间，阻塞增量缓冲追加，确保没有遗漏
+    // 在追写线程暂停后，要把缓存队列中的数据（还没来得及放入旧AOF中的指令）也写入新AOF中
     {
         std::lock_guard<std::mutex> lg(incr_mtx_);
         for (const auto &s : incr_cmds_) {
@@ -579,6 +582,7 @@ void AofLogger::rewriterLoop(KeyValueStore *store) {
         incr_cmds_.clear();
     }
     ::fdatasync(wfd);
+
     // 原子替换并切换 fd
     {
         std::string final_path = path();
@@ -593,6 +597,7 @@ void AofLogger::rewriterLoop(KeyValueStore *store) {
             ::close(dfd);
         }
     }
+
     pause_writer_.store(false);
     cv_pause_.notify_all();
     // 清理增量
@@ -601,6 +606,61 @@ void AofLogger::rewriterLoop(KeyValueStore *store) {
         incr_cmds_.clear();
     }
     rewriting_.store(false);
+}
+
+// 路径字符串的拼接
+static std::string joinPath(const std::string &dir, cnrespArrayonst std::string &file) {
+    if (dir.empty())
+        return file;
+    if (dir.back() == '/')
+        return dir + file;
+    return dir + "/" + file;
+}
+
+// 将数据完整写入文件中
+static bool writeAllFD(int fd, const char *data, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = ::write(fd, data + off, len - off);
+        if (w > 0) {
+            off += static_cast<size_t>(w);
+            continue;
+        }
+        if (w < 0 && (errno == EINTR || errno == EAGAIN)) {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+// 将vector数组转为RESP协议下的字符串类型，例如：
+// *2\r\n
+// $3\r\nGET\r\n
+// $4\r\nname\r\n
+std::string respArray(const std::vector<std::string> &parts) {
+    std::string out;
+    out.reserve(16 * parts.size());
+    out.append("*").append(std::to_string(parts.size())).append("\r\n");
+    for (const auto &p : parts) {
+        out.append("$").append(std::to_string(p.size())).append("\r\n");
+        out.append(p).append("\r\n");
+    }
+    return out;
+}
+
+std::optional<AofMode> parseAofMode(const std::string &s) {
+    if (s == "no")
+        return AofMode::kNo;
+    if (s == "everysec")
+        return AofMode::kEverySec;
+    if (s == "always")
+        return AofMode::kAlways;
+    return std::nullopt;
+}
+
+std::string AofLogger::path() const {
+    return joinPath(opts_.dir, opts_.filename);
 }
 
 } // namespace mini_redis

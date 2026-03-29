@@ -351,7 +351,7 @@ int KeyValueStore::expireScanStep(int max_steps) {
     return removed; //返回实际移除的数量
 }
 
-// 当前键值数据库的快照拷贝函数：把当前对应类型map_中的所有KV数据复制一份出来，返回给调用者
+// 当前键值数据库的快照拷贝函数：把相应类型map_中的所有KV数据复制一份出来，返回给调用者
 std::vector<std::pair<std::string, ValueRecord>> KeyValueStore::snapshot() const {
     std::lock_guard<std::mutex> lk(mu_);
     std::vector<std::pair<std::string, ValueRecord>> out;

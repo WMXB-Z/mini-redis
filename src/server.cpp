@@ -165,7 +165,7 @@ int Server::setupEpoll() {
     return 0;
 }
 
-KeyValueStore g_store;  //定义内存数据库，即真正存储key-value 数据的地方
+KeyValueStore g_store;  //key-vlaue键值存储类，即真正存储key-value 数据的地方
 static AofLogger g_aof; //记录所有写操作（用于持久化）
 static Rdb g_rdb; //做数据库快照（类似 Redis 的 dump.rdb）
 static std::vector<std::vector<std::string>> g_repl_queue;  //保存要同步给从节点（replica）的命令（主从复制）
@@ -395,7 +395,7 @@ static std::string handle_command(const RespValue &v, const std::string *raw) {
         g_store.set(v.array[1].bulk, v.array[2].bulk, ttl_ms);
 
 
-        // 如果传入了原始 RESP 文本 raw → 直接写入 AOF；否则把 v.array 转成字符串数组记录 AOF
+        // 如果传入了原始RESP文本 raw → 直接写入 AOF；否则把 v.array 转成字符串数组记录 AOF
         // 例子：parts = ["SET","mykey","123"] → 写入 AOF
         if (raw)
             g_aof.appendRaw(*raw);
@@ -857,7 +857,6 @@ static std::string handle_command(const RespValue &v, const std::string *raw) {
     return respError("ERR unknown command");
 }
 
-
 // 一个基于epoll的高性能事件循环（类似Redis/Reactor模型），而且还带了简单主从复制（replication）逻辑。
 int Server::loop() {
     std::unordered_map<int, Conn> conns;    //每个客户端连接的<连接套接字,用户区缓冲区>
@@ -1217,7 +1216,7 @@ int Server::run() {
         // 调用 g_rdb.setOptions() 初始化RDB参数
         // 调用 g_rdb.load() 从 RDB 文件加载数据到内存g_store
         // 如果加载失败，记录日志并返回错误
-    // g_store 是服务器的 内存数据库实例
+    // g_store是redis中的键值存储类，真正放数据的地方
     if (config_.rdb.enabled) {
         g_rdb.setOptions(config_.rdb);
         std::string err;
@@ -1231,7 +1230,7 @@ int Server::run() {
         // 初始化 AOF（日志文件）
         // 加载 AOF 日志中的操作，恢复到内存数据库 g_store
         // 出现错误时记录日志并返回
-    // RDB 是快照，AOF 是操作日志，这两者都能恢复数据，通常先 RDB 再 AOF 以保证完整性
+    // RDB 是快照，AOF是操作日志，这两者都能恢复数据，通常先RDB再 AOF 以保证完整性
     if (config_.aof.enabled) {
         std::string err;
         if (!g_aof.init(config_.aof, err)) {
