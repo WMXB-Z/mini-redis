@@ -36,6 +36,3 @@ cmake --build build -j
 启动从节点（配置文件：replica.conf）：
 
 ./build/mini_redis --config replica.conf
-
-
-test

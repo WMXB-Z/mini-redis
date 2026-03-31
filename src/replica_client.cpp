@@ -83,7 +83,7 @@ void ReplicaClient::threadMain() {
                 fwrite(v->bulk.data(), 1, v->bulk.size(), f);
                 fclose(f);
                 std::string err;
-                r.load(g_store, err);//从 RDB 文件加载数据到g_store，完成全量同步
+                r.load(g_store, err);//从RDB文件加载数据到g_store，完成全量同步
             } else if (v->type == RespType::kArray) {   // 情况二：命令流（增量同步）
                 if (v->array.empty()) continue;
                 std::string cmd;
