@@ -82,7 +82,5 @@ private:
     void rewriterLoop(KeyValueStore *store);
 };
 
-// helpers
-std::string respArray(const std::vector<std::string> &parts);
 
 } // namespace mini_redis

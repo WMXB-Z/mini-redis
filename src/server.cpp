@@ -1095,7 +1095,7 @@ int Server::loop() {
                             continue;
                             
                         for (const auto &parts : g_repl_queue) {//依次广播每条指令
-                            std::string cmd = toRespArray(parts);   
+                            std::string cmd = respArray(parts);   
                             int64_t next_off = g_repl_offset + static_cast<int64_t>(cmd.size());
                             std::string off = "+OFFSET " + std::to_string(next_off) + "\r\n";
                             appendToBacklog(off);

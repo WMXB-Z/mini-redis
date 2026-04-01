@@ -89,5 +89,6 @@ std::string respError(std::string_view s);
 std::string respBulk(std::string_view s);
 std::string respNullBulk();
 std::string respInteger(int64_t v);
+std::string respArray(const std::vector<std::string> &parts);
 
 } // namespace mini_redis

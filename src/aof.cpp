@@ -1,6 +1,5 @@
 #include "mini_redis/aof.hpp"
-#include "mini_redis/kv.hpp"
-#include "mini_redis/log.hpp"
+
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -12,7 +11,63 @@
 #include <sys/stat.h>
 #include <sys/uio.h>
 
+#include "mini_redis/kv.hpp"
+#include "mini_redis/log.hpp"
+#include "mini_redis/tools.hpp"
+#include "mini_redis/resp.hpp"
+
 namespace mini_redis {
+
+// // 路径字符串的拼接
+// static std::string joinPath(const std::string &dir, const std::string &file) {
+//     if (dir.empty())
+//         return file;
+//     if (dir.back() == '/')
+//         return dir + file;
+//     return dir + "/" + file;
+// }
+
+// // 将数据完整写入文件中
+// static bool writeAllFD(int fd, const char *data, size_t len) {
+//     size_t off = 0;
+//     while (off < len) {
+//         ssize_t w = ::write(fd, data + off, len - off);
+//         if (w > 0) {
+//             off += static_cast<size_t>(w);
+//             continue;
+//         }
+//         if (w < 0 && (errno == EINTR || errno == EAGAIN)) {
+//             continue;
+//         }
+//         return false;
+//     }
+//     return true;
+// }
+
+// // 将vector数组转为RESP协议下的字符串类型，例如：
+// // *2\r\n
+// // $3\r\nGET\r\n
+// // $4\r\nname\r\n
+// std::string respArray(const std::vector<std::string> &parts) {
+//     std::string out;
+//     out.reserve(16 * parts.size());
+//     out.append("*").append(std::to_string(parts.size())).append("\r\n");
+//     for (const auto &p : parts) {
+//         out.append("$").append(std::to_string(p.size())).append("\r\n");
+//         out.append(p).append("\r\n");
+//     }
+//     return out;
+// }
+
+std::optional<AofMode> parseAofMode(const std::string &s) {
+    if (s == "no")
+        return AofMode::kNo;
+    if (s == "everysec")
+        return AofMode::kEverySec;
+    if (s == "always")
+        return AofMode::kAlways;
+    return std::nullopt;
+}
 
 AofLogger::AofLogger() = default;
 AofLogger::~AofLogger() { shutdown(); }
@@ -473,7 +528,7 @@ bool AofLogger::bgRewrite(KeyValueStore &store, std::string &err) {
         return false;
     }
 
-    if(rewriter_thread_.joinable) 
+    if(rewriter_thread_.joinable()) 
         rewriter_thread_.join();
 
     rewriter_thread_ = std::thread(&AofLogger::rewriterLoop, this, &store);
@@ -608,59 +663,7 @@ void AofLogger::rewriterLoop(KeyValueStore *store) {
     rewriting_.store(false);
 }
 
-// 路径字符串的拼接
-static std::string joinPath(const std::string &dir, cnrespArrayonst std::string &file) {
-    if (dir.empty())
-        return file;
-    if (dir.back() == '/')
-        return dir + file;
-    return dir + "/" + file;
-}
-
-// 将数据完整写入文件中
-static bool writeAllFD(int fd, const char *data, size_t len) {
-    size_t off = 0;
-    while (off < len) {
-        ssize_t w = ::write(fd, data + off, len - off);
-        if (w > 0) {
-            off += static_cast<size_t>(w);
-            continue;
-        }
-        if (w < 0 && (errno == EINTR || errno == EAGAIN)) {
-            continue;
-        }
-        return false;
-    }
-    return true;
-}
-
-// 将vector数组转为RESP协议下的字符串类型，例如：
-// *2\r\n
-// $3\r\nGET\r\n
-// $4\r\nname\r\n
-std::string respArray(const std::vector<std::string> &parts) {
-    std::string out;
-    out.reserve(16 * parts.size());
-    out.append("*").append(std::to_string(parts.size())).append("\r\n");
-    for (const auto &p : parts) {
-        out.append("$").append(std::to_string(p.size())).append("\r\n");
-        out.append(p).append("\r\n");
-    }
-    return out;
-}
-
-std::optional<AofMode> parseAofMode(const std::string &s) {
-    if (s == "no")
-        return AofMode::kNo;
-    if (s == "everysec")
-        return AofMode::kEverySec;
-    if (s == "always")
-        return AofMode::kAlways;
-    return std::nullopt;
-}
-
 std::string AofLogger::path() const {
     return joinPath(opts_.dir, opts_.filename);
 }
-
 } // namespace mini_redis

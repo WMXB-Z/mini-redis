@@ -34,7 +34,8 @@ add_executable(mini_redis
   src/aof.cpp
   src/rdb.cpp
   src/replica_client.cpp
-)
+  src/tools.cpp
+)   
 
 target_compile_definitions(mini_redis PRIVATE $<$<CONFIG:Debug>:MINI_REDIS_DEBUG=1>)
 

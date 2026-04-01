@@ -247,4 +247,19 @@ std::string respNullBulk() { return "$-1\r\n"; }
 
 std::string respInteger(int64_t v) { return ":" + std::to_string(v) + "\r\n"; }
 
+// 将vector数组转为RESP协议下的字符串类型，例如：
+// *2\r\n
+// $3\r\nGET\r\n
+// $4\r\nname\r\n
+std::string respArray(const std::vector<std::string> &parts) {
+    std::string out;
+    out.reserve(16 * parts.size());
+    out.append("*").append(std::to_string(parts.size())).append("\r\n");
+    for (const auto &p : parts) {
+        out.append("$").append(std::to_string(p.size())).append("\r\n");
+        out.append(p).append("\r\n");
+    }
+    return out;
+}
+
 } // namespace mini_redis

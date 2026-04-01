@@ -51,9 +51,9 @@ void ReplicaClient::threadMain() {
     std::string first;
     // 首次同步方式使用SYNC（全量同步），非首次使用PSYNC（增量同步）
     if (last_offset_ > 0) {
-        first = toRespArray({std::string("PSYNC"), std::to_string(last_offset_)});
+        first = respArray({std::string("PSYNC"), std::to_string(last_offset_)});
     } else {
-        first = toRespArray({std::string("SYNC")});
+        first = respArray({std::string("SYNC")});
     }
     // 向服务器发送指令
     ::send(fd, first.data(), first.size(), 0);

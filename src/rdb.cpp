@@ -1,21 +1,21 @@
 #include "mini_redis/rdb.hpp"
-
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <filesystem>
 #include "mini_redis/kv.hpp"
+#include "mini_redis/tools.hpp"
 namespace mini_redis {
 
-// 路径拼接函数
-static std::string joinPath(const std::string &dir, const std::string &file) {
-    if (dir.empty())
-        return file;
-    if (dir.back() == '/')
-        return dir + file;
-    return dir + "/" + file;
-}
+// // 路径拼接函数
+// static std::string joinPath(const std::string &dir, const std::string &file) {
+//     if (dir.empty())
+//         return file;
+//     if (dir.back() == '/')
+//         return dir + file;
+//     return dir + "/" + file;
+// }
 
 std::string Rdb::path() const { 
     return joinPath(opts_.dir, opts_.filename); 
